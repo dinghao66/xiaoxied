@@ -1,0 +1,252 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import lightning.pytorch as pl
+import torchmetrics
+from torch import Tensor
+from torch.utils.data import DataLoader, TensorDataset
+import numpy as np
+import pandas as pd
+
+# ---------------------- 1. 超参数设置（仅修改输出路径） ----------------------
+class Config:
+    input_excel_path = "/dat05/users/dinghao/h_or/h_3000.xlsx"
+    gene_num = 3000      # 基因数量
+    voxel_num = 213       # 体素数量（硬编码）
+    latent_dim = 50       # 目标降维维度
+    batch_size = 32       # CPU训练批次大小
+    epochs = 40           # 训练轮数
+    lr = 2e-4             # 学习率
+    device = torch.device("cpu")  # 强制使用CPU
+    # 仅修改这两行：输出路径改为目标目录
+    output_latent_excel = "/dat05/users/dinghao/h_or/jieguo/vae_latent_3000_cpu.xlsx"
+    output_gene_mapping = "/dat05/users/dinghao/h_or/jieguo/vae_gene_latent_mapping_3000.xlsx"
+
+config = Config()
+
+# ---------------------- 2. VAE模型（不变） ----------------------
+class VAE(pl.LightningModule):
+    def __init__(self, input_dim: int = config.voxel_num, latent_dim: int = config.latent_dim):
+        super().__init__()
+        self.save_hyperparameters()
+        
+        self.encoder = nn.Sequential(
+            nn.Linear(input_dim, 256),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(256, 128),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(128, 64),
+            nn.ReLU()
+        )
+        self.fc_mu = nn.Linear(64, latent_dim)
+        self.fc_log_var = nn.Linear(64, latent_dim)
+        
+        self.decoder = nn.Sequential(
+            nn.Linear(latent_dim, 64),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(64, 128),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(128, 256),
+            nn.ReLU(),
+            nn.Linear(256, input_dim),
+            nn.Sigmoid()
+        )
+        
+        self.recon_mse = torchmetrics.MeanSquaredError()
+
+    def reparameterize(self, mu: Tensor, log_var: Tensor) -> Tensor:
+        std = torch.exp(0.5 * log_var)
+        eps = torch.randn_like(std)
+        return mu + eps * std
+
+    def forward(self, x: Tensor) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+        encoder_out = self.encoder(x)
+        mu = self.fc_mu(encoder_out)
+        log_var = self.fc_log_var(encoder_out)
+        z = self.reparameterize(mu, log_var)
+        x_recon = self.decoder(z)
+        return x_recon, mu, log_var, z
+
+    def training_step(self, batch: tuple[Tensor], batch_idx: int) -> Tensor:
+        x = batch[0]
+        assert x.shape[1] == config.voxel_num, f"输入维度错误！期望{config.voxel_num}，实际{x.shape[1]}"
+        
+        x_recon, mu, log_var, z = self(x)
+        
+        recon_loss = F.mse_loss(x_recon, x, reduction="mean")
+        kl_loss = -0.5 * torch.mean(1 + log_var - mu.pow(2) - log_var.exp())
+        total_loss = recon_loss + 0.1 * kl_loss
+        
+        self.log("train_total_loss", total_loss, prog_bar=True)
+        self.log("train_recon_loss", recon_loss, prog_bar=True)
+        self.recon_mse(x_recon, x)
+        self.log("train_recon_mse", self.recon_mse, prog_bar=True)
+        
+        return total_loss
+
+    def configure_optimizers(self) -> torch.optim.Optimizer:
+        return torch.optim.Adam(self.parameters(), lr=config.lr, weight_decay=1e-5)
+
+# ---------------------- 3. 数据模块（不变，强制213维） ----------------------
+class VAEDataModule(pl.LightningDataModule):
+    def __init__(self, input_excel_path: str = config.input_excel_path, batch_size: int = config.batch_size):
+        super().__init__()
+        self.input_excel_path = input_excel_path
+        self.batch_size = batch_size
+        self.raw_data = None  # (5000, 213)
+        self.gene_names = None
+        self.voxel_names = None
+        self.data_normalized = None
+
+    def prepare_data(self):
+        print(f"读取输入Excel：{self.input_excel_path}")
+        df_raw = pd.read_excel(
+            self.input_excel_path,
+            engine="openpyxl",
+            header=0,
+            index_col=0
+        )
+        
+        print(f"Excel读取后原始形状：{df_raw.shape}（行=基因，列=体素）")
+        print(f"Excel实际体素列数：{len(df_raw.columns)}")
+        
+        # 强制对齐213列
+        if len(df_raw.columns) >= config.voxel_num:
+            df_raw = df_raw.iloc[:, :config.voxel_num]
+            print(f"列数足够，截取前{config.voxel_num}列")
+        else:
+            missing_cols = config.voxel_num - len(df_raw.columns)
+            df_raw = pd.concat([
+                df_raw,
+                pd.DataFrame(0, index=df_raw.index, columns=[f"fill_col_{i}" for i in range(missing_cols)])
+            ], axis=1)
+            print(f"列数不足，填充{missing_cols}列（值为0）")
+        
+        # 截取前15633行基因
+        df_raw = df_raw.iloc[:config.gene_num, :].copy()
+        
+        self.gene_names = df_raw.index.tolist()
+        self.voxel_names = df_raw.columns.tolist()
+        
+        # 数据清洗
+        df_numeric = df_raw.apply(pd.to_numeric, errors="coerce")
+        df_numeric = df_numeric.fillna(df_numeric.median())
+        
+        self.raw_data = torch.tensor(df_numeric.values, dtype=torch.float32)
+        print(f"最终数据形状：{self.raw_data.shape}（基因×体素）")
+        assert self.raw_data.shape == (config.gene_num, config.voxel_num), \
+            f"数据维度最终校验失败！期望({config.gene_num}, {config.voxel_num})，实际{self.raw_data.shape}"
+
+    def setup(self, stage: str = None):
+        min_val = self.raw_data.min()
+        max_val = self.raw_data.max()
+        self.data_normalized = (self.raw_data - min_val) / (max_val - min_val + 1e-8)
+        self.dataset = TensorDataset(self.data_normalized)
+
+    def train_dataloader(self) -> DataLoader:
+        return DataLoader(
+            self.dataset,
+            batch_size=self.batch_size,
+            shuffle=True,
+            num_workers=0,
+            pin_memory=False,
+            drop_last=False
+        )
+
+# ---------------------- 4. 核心修正：保存函数（仅添加目录创建，不改动逻辑） ----------------------
+def save_latent_data(data_module: VAEDataModule, latent_all_genes: Tensor):
+    """
+    正确逻辑（唯一正确的方式）：
+    latent_all_genes: (15633, 50) → 每个基因的50维特征
+    raw_data: (15633, 213) → 每个基因在每个体素上的数值
+    加权求和得到：50维×213体素 → (50, 213)
+    """
+    # 仅添加：自动创建目标目录（避免目录不存在报错）
+    import os
+    output_dir = "/dat05/users/dinghao/h_or/jieguo/"
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+        print(f"已创建目标目录：{output_dir}")
+    
+    # 关键：矩阵乘法（50,15633）×（15633,213）=（50,213），维度完全匹配体素名
+    latent_voxel = torch.matmul(latent_all_genes.T, data_module.raw_data)  # 这行是核心，不能改
+    
+    # 保存主文件（50维×213体素）
+    latent_names = [f"Latent_Dim_{i+1}" for i in range(config.latent_dim)]
+    df_latent_voxel = pd.DataFrame(
+        data=latent_voxel.numpy(),  # 直接用计算后的(50,213)，不转置
+        index=latent_names,         # 50行（潜在维度）
+        columns=data_module.voxel_names  # 213列（体素名）
+    )
+    df_latent_voxel.to_excel(config.output_latent_excel, engine="openpyxl")
+    print(f"\n主文件已保存：{config.output_latent_excel}")
+    print(f"结构：{df_latent_voxel.shape[0]}行（50维）× {df_latent_voxel.shape[1]}列（体素）")
+
+    # 保存映射文件（基因×50维，不变）
+    df_gene_mapping = pd.DataFrame(
+        data=latent_all_genes.numpy(),  # (15633,50)
+        index=data_module.gene_names,   # 15633行（基因名）
+        columns=latent_names            # 50列（潜在维度）
+    )
+    df_gene_mapping.to_excel(config.output_gene_mapping, engine="openpyxl")
+    print(f"映射文件已保存：{config.output_gene_mapping}")
+
+# ---------------------- 5. 主流程（仅修改模型保存路径） ----------------------
+if __name__ == "__main__":
+    # 1. 初始化数据模块
+    data_module = VAEDataModule()
+    data_module.prepare_data()
+    data_module.setup()
+
+    # 2. 初始化模型
+    vae_model = VAE()
+
+    # 3. 训练器配置
+    trainer = pl.Trainer(
+        max_epochs=config.epochs,
+        accelerator="cpu",
+        devices=1,
+        logger=pl.loggers.TensorBoardLogger("logs_cpu/"),
+        enable_checkpointing=True,
+        deterministic=True,
+        gradient_clip_val=1.0,
+        accumulate_grad_batches=1,
+        precision="32-true",
+        benchmark=False,
+        num_sanity_val_steps=0
+    )
+
+    # 4. 训练模型
+    print(f"\n开始CPU训练（批次：{config.batch_size}，轮数：{config.epochs}，体素数：{config.voxel_num}）...")
+    trainer.fit(model=vae_model, datamodule=data_module)
+    # 仅修改：模型也保存到目标目录
+    torch.save(vae_model.state_dict(), "/dat05/users/dinghao/h_or/jieguo/vae_gene_to_3000_cpu.pth")
+    print("\n模型保存完成！")
+
+    # 5. 提取特征
+    print("\n提取50维潜在特征...")
+    vae_model.eval()
+    latent_vectors = []
+
+    with torch.no_grad():
+        dataloader = DataLoader(
+            data_module.dataset,
+            batch_size=config.batch_size,
+            shuffle=False,
+            num_workers=0
+        )
+        for batch_idx, batch in enumerate(dataloader):
+            x = batch[0]
+            _, _, _, z = vae_model(x)
+            latent_vectors.append(z)
+            if (batch_idx + 1) % 20 == 0:
+                print(f"已处理 {batch_idx + 1}/{len(dataloader)} 批次")
+
+    latent_all_genes = torch.cat(latent_vectors, dim=0)
+    print(f"\n基因潜在特征形状：{latent_all_genes.shape}")
+    # 6. 保存结果（现在维度完全匹配）
+save_latent_data(data_module, latent_all_genes)
