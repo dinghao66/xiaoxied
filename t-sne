@@ -1,0 +1,116 @@
+# 导入必要的库
+import pandas as pd                    # 用于读取和处理 Excel 数据
+import numpy as np                     # 提供数值计算支持
+from sklearn.manifold import TSNE      # t-SNE 降维算法
+import matplotlib.pyplot as plt        # 绘图基础库
+import seaborn as sns                  # 美观绘图封装
+import os                              # 操作系统接口，用于检查文件是否存在
+
+# ================== 参数设置 ==================
+input_file = '/dat05/users/dinghao/vae_latent_2500ge2.xlsx'  # 输入的Excel文件路径
+sheet_name = 'Sheet1'                 # 要读取的工作表名称
+id_column_index = 0                   # 第一列是行名（如 Latent_Dim_1），不参与计算
+n_components = 2                      # t-SNE 输出维度（2D 可视化）
+perplexity = 30                       # 困惑度：控制局部与全局结构平衡，一般在 5~50 之间
+learning_rate = 200                   # 学习率，通常 100~1000，太小收敛慢，太大不稳定
+n_iter = 1000                         # 最大迭代次数，建议 ≥1000 才能收敛
+random_state = 42                     # 随机种子，保证结果可复现
+figsize = (10, 8)                     # 图像大小
+
+
+# ================== 步骤1：检查并读取数据 ==================
+# 检查文件是否存在
+if not os.path.exists(input_file):
+    raise FileNotFoundError(f"❌ 找不到文件: {input_file}")
+
+# 使用 pandas 读取指定工作表
+df = pd.read_excel(input_file, sheet_name=sheet_name)
+
+# 显示前几行数据，帮助确认格式
+print("✅ 成功读取原始数据，前5行预览：")
+print(df.head())
+
+# ================== 步骤2：数据预处理（设置索引 + 数值化 + 转置）==================
+# 将第一列设为行索引（例如 Latent_Dim_1, Latent_Dim_2...）
+df = df.set_index(df.columns[id_column_index])
+
+# 将所有数据转换为数值类型，无法转换的变为 NaN
+df_numeric = df.apply(pd.to_numeric, errors='coerce')
+
+# 转置数据：原来是【行为特征，列为样本】→ 现在变成【行为样本，列为特征】
+data_transposed = df_numeric.T
+
+# 检查转置后是否有有效数据
+if data_transposed.empty or data_transposed.isna().all().all():
+    raise ValueError("❌ 转置后无有效数值数据，请检查表格内容是否正确。")
+
+# 删除全为空的列（如果有）
+feature_data = data_transposed.dropna(axis=1, how='all')
+
+# 填充剩余缺失值（t-SNE 不接受 NaN）
+feature_data = feature_data.fillna(feature_data.mean())  # 用均值填充
+
+print(f"✅ 转置后数据形状: {feature_data.shape} → （{feature_data.shape[0]} 个样本, {feature_data.shape[1]} 个特征）")
+
+# 样本标签：使用原始列名（如 -1, 1, 3...）作为每个点的标识
+labels = feature_data.index.astype(str)  # 获取样本名（即原列名）
+
+# ================== 步骤3：执行 t-SNE 降维 ==================
+print("🚀 正在进行 t-SNE 降维...")
+tsne = TSNE(
+    n_components=n_components,          # 输出二维坐标
+    perplexity=perplexity,             # 困惑度，影响局部与全局结构平衡
+    learning_rate=learning_rate,       # 学习率
+    max_iter=n_iter,                   # ✅ 改这里！原来是 n_iter，现在必须用 max_iter
+    random_state=random_state,         # 固定随机种子以复现实验
+    verbose=1                          # 显示优化过程进度（可选）
+)
+embedding = tsne.fit_transform(feature_data)  # 开始降维运算
+
+
+# 将结果保存到 DataFrame，便于后续绘图
+tsne_df = pd.DataFrame({
+    'tSNE1': embedding[:, 0],           # 第一维
+    'tSNE2': embedding[:, 1],           # 第二维
+    'Sample': labels                    # 样本标签（如 -1, 1, 3...）
+})
+
+# ================== 步骤4：绘制 t-SNE 结果图 ==================
+print("📈 正在绘制 t-SNE 可视化结果...")
+
+# 设置美观的主题风格
+sns.set(style="whitegrid", font_scale=1.2)
+
+# 创建画布
+plt.figure(figsize=figsize)
+
+# 自动选择配色方案：如果样本种类少用分类色，多则用光谱色
+palette = "tab10" if tsne_df['Sample'].nunique() <= 10 else "Spectral"
+
+# 绘制散点图
+ax = sns.scatterplot(
+    x='tSNE1', y='tSNE2',               # x 和 y 是 t-SNE 的两个维度
+    hue='Sample',                       # 不同样本用不同颜色（若太多会渐变）
+    data=tsne_df,
+    palette=palette,
+    s=120,                              # 点的大小
+    alpha=0.85,                         # 透明度
+    edgecolor='k',                      # 边框颜色
+    linewidth=0.4                       # 边框宽度
+)
+
+# 添加图表标题和坐标轴标签
+plt.title('t-SNE Visualization of 213 Samples\n(Each Point = One Sample)', fontsize=16, pad=20)
+plt.xlabel('t-SNE 1', fontsize=12)
+plt.ylabel('t-SNE 2', fontsize=12)
+
+# 将图例移到右侧外部，避免遮挡数据
+ax.legend(title='Sample ID', bbox_to_anchor=(1.05, 1), loc='upper left')
+
+# 自动调整布局，防止被裁剪
+plt.tight_layout()
+
+# 显示图像（程序暂停直到关闭窗口）
+plt.show()
+
+
