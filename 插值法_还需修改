@@ -1,0 +1,77 @@
+import numpy as np
+import pandas as pd
+from sklearn.neighbors import KNeighborsRegressor
+from tqdm import tqdm
+import os
+import nibabel as nib  # 用于加载标准 brain mask
+
+# ==================== 配置路径 ====================
+excel_path = "/dat05/users/dinghao/h_latent/h_d3600.xlsx"
+output_dir = "/dat05/users/dinghao/h_latent/knn_3d_maps/"
+os.makedirs(output_dir, exist_ok=True)
+
+# 可选：加载标准 brain mask（例如 MNI152 1mm）
+# 如果没有，可使用全零网格 (197,233,189)
+mask_path = "/path/to/MNI152_brain_mask.nii.gz"  # 替换为你的 mask 路径，或设为 None
+
+# ==================== 1. 加载表达矩阵 ====================
+print("Loading expression matrix...")
+df = pd.read_excel(excel_path, index_col=0)  # 第一列为行名（如 latent_1）
+expr = df.values.astype(np.float32)          # (50, 213)
+gene_names = df.index.tolist()               # 50 个名称
+
+print(f"Expression shape: {expr.shape}")
+
+# ==================== 2. 加载或构建真实坐标 (213, 3) ====================
+# ❗❗❗ 这是最关键的部分：你必须有真实 MNI 坐标 ❗❗❗
+
+# 方案 A：如果你有 sample_information.csv（推荐！）
+# sample_info = pd.read_csv("/path/to/sample_information.csv")
+# well_ids = df.columns  # Excel 的列名应为 well_id，如 '98619098'
+# coords = sample_info.set_index('well_id').loc[well_ids, ['mni_x', 'mni_y', 'mni_z']].values
+
+# 方案 B：如果你只有“伪坐标”但坚持用（不推荐）
+# 假设列名是 x，y=z=100（仅演示）
+x_vals = np.array([float(col) for col in df.columns])
+coords = np.column_stack([x_vals, np.full_like(x_vals, 100), np.full_like(x_vals, 100)])
+
+# ⚠️ 但根据你之前的数据，更可能是：
+# 你有 213 个体素，但没有真实坐标 → 无法科学插值！
+
+# ==================== 3. 定义目标空间（全脑网格）====================
+if os.path.exists(mask_path):
+    mask_img = nib.load(mask_path)
+    mask = mask_img.get_fdata() > 0
+    affine = mask_img.affine
+else:
+    # 使用标准 MNI152 1mm 尺寸
+    mask_shape = (197, 233, 189)
+    mask = np.ones(mask_shape, dtype=bool)  # 全脑（无 mask）
+    affine = np.eye(4)  # 单位仿射矩阵
+
+# 获取所有目标体素坐标（在 mask 内）
+target_coords = np.argwhere(mask)  # (N, 3)，单位：voxel index
+
+print(f"Interpolating to {target_coords.shape[0]} voxels...")
+
+# ==================== 4. 对每个基因/latent 进行 KNN 插值 ====================
+knn = KNeighborsRegressor(n_neighbors=5, weights='distance', n_jobs=-1)
+
+for i in tqdm(range(expr.shape[0]), desc="Interpolating"):
+    gene_name = str(gene_names[i]).replace("/", "_").replace("\\", "_")
+    values = expr[i, :]  # (213,)
+
+    # 训练 KNN 模型
+    knn.fit(coords, values)
+
+    # 预测所有目标体素
+    pred_values = knn.predict(target_coords)
+
+    # 构建 3D volume
+    vol = np.zeros(mask.shape, dtype=np.float32)
+    vol[tuple(target_coords.T)] = pred_values
+
+    # 保存为 .npy
+    np.save(os.path.join(output_dir, f"{gene_name}.npy"), vol)
+
+print(f"✅ All 3D maps saved to: {output_dir}")
